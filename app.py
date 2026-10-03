@@ -46,6 +46,7 @@ class Repository:
         CREATE TABLE IF NOT EXISTS quotas(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, station_id TEXT NOT NULL REFERENCES stations(id), daily_seconds INTEGER NOT NULL, UNIQUE(tenant,station_id));
         CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS window_change_orders(id INTEGER PRIMARY KEY AUTOINCREMENT, window_id INTEGER NOT NULL REFERENCES visibility_windows(id), from_revision INTEGER NOT NULL, to_revision INTEGER NOT NULL, actor TEXT NOT NULL, role TEXT NOT NULL, reason TEXT NOT NULL, impacts_json TEXT NOT NULL, created_at TEXT NOT NULL);
         """)
 
     @contextmanager
@@ -251,26 +252,111 @@ class SatelliteSchedulingService:
         if role not in {"operator", "commander"}: raise ApiError(403, "window_forbidden", "当前角色不能变更可见窗口")
         start, end = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
         if end <= start: raise ApiError(400, "invalid_window", "窗口结束时间必须晚于开始时间")
+        max_rate = body.get("max_rate_mbps")
+        if max_rate is not None and (not isinstance(max_rate, (int, float)) or float(max_rate) <= 0):
+            raise ApiError(400, "invalid_window", "窗口码率必须为正数")
+        expected_revision = body.get("revision")
+        if expected_revision is not None and not isinstance(expected_revision, int):
+            raise ApiError(400, "invalid_revision", "窗口版本必须为整数")
+        reason = str(body.get("reason", "")).strip() or "visibility_window_changed"
+
         with self.repo.tx() as conn:
             window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
             if not window: raise ApiError(404, "window_not_found", "可见窗口不存在")
-            rows = conn.execute("SELECT * FROM schedules WHERE window_id=? AND status IN ('scheduled','receiving','received')", (window_id,)).fetchall()
-            impacts = []
+            current_revision = window["revision"]
+            if expected_revision is not None and expected_revision != current_revision:
+                # 版本过期：窗口、排程、请求全部读回当前已提交版本
+                schedules = [dict(r) for r in conn.execute("SELECT * FROM schedules WHERE window_id=? ORDER BY id", (window_id,)).fetchall()]
+                req_ids = [s["request_id"] for s in schedules]
+                requests: list[dict[str, Any]] = []
+                if req_ids:
+                    placeholders = ",".join("?" * len(req_ids))
+                    requests = [dict(r) for r in conn.execute(f"SELECT * FROM requests WHERE id IN ({placeholders}) ORDER BY id", req_ids).fetchall()]
+                raise ApiError(409, "window_revision_conflict", "窗口版本已过期，请基于最新版本刷新后重试", {
+                    "window": dict(window), "schedules": schedules, "requests": requests,
+                    "expected_revision": expected_revision, "current_revision": current_revision,
+                })
+
+            new_max_rate = float(max_rate) if max_rate is not None else float(window["max_rate_mbps"])
+            w_start, w_end = start, end
+            rows = conn.execute("""SELECT s.*, r.data_mb, r.priority, r.tenant
+                                   FROM schedules s JOIN requests r ON r.id=s.request_id
+                                   WHERE s.window_id=? AND s.status IN ('scheduled','receiving','received')
+                                   ORDER BY s.id""", (window_id,)).fetchall()
+            snapshot = [dict(r) for r in rows]
+            impacts: list[dict[str, Any]] = []
+            kept: list[sqlite3.Row] = []
+            preempted: list[sqlite3.Row] = []
+
+            # 按窗口版本和排程快照列出保留、压缩、抢占影响
             for row in rows:
-                sched_start, sched_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
-                invalid = sched_start < start or sched_end > end
                 if row["status"] == "received":
-                    impacts.append({"schedule_id": row["id"], "action": "preserve_received_data", "reason": "已接收数据不可回滚", "invalid": invalid})
+                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "tenant": row["tenant"],
+                                    "action": "preserve_received_data", "reason": "已接收数据不可回滚",
+                                    "starts_at": row["starts_at"], "ends_at": row["ends_at"]})
                     continue
-                if invalid:
-                    conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
-                    conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
-                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted", "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]})
+                s_start, s_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
+                trimmed_start, trimmed_end = max(s_start, w_start), min(s_end, w_end)
+                rate = float(row["rate_mbps"])
+                needed_seconds = float(row["data_mb"]) * 8 / rate
+                fits = trimmed_start < trimmed_end and (trimmed_end - trimmed_start).total_seconds() >= needed_seconds
+                if not fits:
+                    preempted.append(row)
+                    continue
+                if row["status"] == "receiving":
+                    # 接收中的排程只要新窗口仍覆盖即保留，不压缩已开始的接收
+                    kept.append(row)
+                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "tenant": row["tenant"],
+                                    "action": "unchanged", "reason": "新窗口仍覆盖接收中排程",
+                                    "starts_at": row["starts_at"], "ends_at": row["ends_at"]})
+                    continue
+                if trimmed_start == s_start and trimmed_end == s_end:
+                    kept.append(row)
+                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "tenant": row["tenant"],
+                                    "action": "unchanged", "reason": "新窗口仍覆盖排程",
+                                    "starts_at": row["starts_at"], "ends_at": row["ends_at"]})
                 else:
-                    impacts.append({"schedule_id": row["id"], "action": "unchanged", "reason": "新窗口仍覆盖排程"})
-            conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,revision=revision+1 WHERE id=?", (iso(start), iso(end), window_id))
-            Repository.audit(conn, None, None, actor, role, "visibility_window_changed", {"window_id": window_id, "impacts": impacts})
-            return {"window": dict(conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()), "impacts": impacts}
+                    kept.append(row)
+                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "tenant": row["tenant"],
+                                    "action": "compressed", "reason": "新窗口收缩，排程压缩至窗口内可接收时段",
+                                    "old_start": row["starts_at"], "old_end": row["ends_at"],
+                                    "starts_at": iso(trimmed_start), "ends_at": iso(trimmed_end)})
+
+            # 容量不足时让未接收请求排队并按优先级抢占（优先级小的先被抢占）
+            preempted.sort(key=lambda r: (r["priority"], r["id"]))
+            for row in preempted:
+                impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "tenant": row["tenant"],
+                                "action": "preempted", "reason": "窗口容量不足或新窗口无法覆盖原排程",
+                                "starts_at": row["starts_at"], "ends_at": row["ends_at"], "priority": row["priority"]})
+
+            # 应用压缩后的排程时间
+            for row in kept:
+                if row["status"] != "scheduled": continue
+                s_start, s_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
+                trimmed_start, trimmed_end = max(s_start, w_start), min(s_end, w_end)
+                if trimmed_start != s_start or trimmed_end != s_end:
+                    conn.execute("UPDATE schedules SET starts_at=?,ends_at=?,revision=revision+1,updated_at=? WHERE id=?",
+                                 (iso(trimmed_start), iso(trimmed_end), iso(), row["id"]))
+
+            # 应用抢占：未接收请求回到排队状态
+            for row in preempted:
+                conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?",
+                             ("visibility_window_changed", iso(), row["id"]))
+                conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
+
+            conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,max_rate_mbps=?,revision=revision+1 WHERE id=?",
+                         (iso(start), iso(end), new_max_rate, window_id))
+            cur = conn.execute("""INSERT INTO window_change_orders(window_id,from_revision,to_revision,actor,role,reason,impacts_json,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?)""",
+                               (window_id, current_revision, current_revision + 1, actor, role, reason,
+                                json.dumps(impacts, ensure_ascii=False, sort_keys=True), iso()))
+            order_id = cur.lastrowid
+            Repository.audit(conn, None, order_id, actor, role, "visibility_window_changed",
+                             {"window_id": window_id, "order_id": order_id, "from_revision": current_revision,
+                              "to_revision": current_revision + 1, "impacts": impacts})
+            return {"window": dict(conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()),
+                    "from_revision": current_revision, "to_revision": current_revision + 1,
+                    "snapshot": snapshot, "impacts": impacts, "order_id": order_id}
 
     def reschedule(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         with self.repo.tx() as conn:
@@ -293,7 +379,12 @@ class SatelliteSchedulingService:
             requests = [dict(r) for r in conn.execute("SELECT * FROM requests ORDER BY id DESC")]
             schedules = [dict(r) for r in conn.execute("SELECT * FROM schedules ORDER BY id DESC")]
             stations = [dict(r) for r in conn.execute("SELECT * FROM stations ORDER BY id")]
-        return {"requests": requests, "schedules": schedules, "stations": stations, "server_time": iso()}
+        orders = [dict(r) for r in conn.execute("SELECT * FROM window_change_orders ORDER BY id DESC LIMIT 20")]
+        for order in orders:
+            order["impacts"] = json.loads(order["impacts_json"]); del order["impacts_json"]
+            if role == "requester":
+                order["impacts"] = [x for x in order["impacts"] if x.get("tenant") == tenant]
+        return {"requests": requests, "schedules": schedules, "stations": stations, "window_changes": orders, "server_time": iso()}
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
