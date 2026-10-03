@@ -1,3 +1,17 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>卫星地面站排程台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}</style>
-<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}.d{border:1px solid #d9e2ec;border-left-width:5px;border-radius:8px;padding:12px;margin:10px 0;background:#f8fafc}.d.applied{border-left-color:#059669}.d.conflicted{border-left-color:#d97706}.d.failed{border-left-color:#dc2626}.d.previewed{border-left-color:#2563eb}.tag{display:inline-block;font-size:12px;padding:1px 8px;border-radius:10px;margin-right:6px;color:white}.tag.retained,.tag.preserve_received_data{background:#059669}.tag.compressed{background:#2563eb}.tag.preempted{background:#d97706}.meta{color:#486581;font-size:13px}.imp{margin:4px 0;padding:4px 8px;background:white;border-radius:6px}</style>
+<h1>卫星地面站排程台</h1><p>查看请求、接收排程、排队队列与窗口变更处置单。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><div id="d"></div><pre id="o"></pre></section>
+<script>
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const ACTIONS={retained:'保留',compressed:'压缩',preempted:'抢占/排队',preserve_received_data:'已接收数据保留'};
+function dispositionCard(x){
+ const impacts=(x.impacts||[]).map(i=>`<div class="imp"><span class="tag ${i.action}">${ACTIONS[i.action]||i.action}</span>排程 #${i.schedule_id}${i.request_id?`（请求 #${i.request_id}${i.priority?`，优先级 ${i.priority}`:''}）`:''} — ${esc(i.reason)}${i.queue_position?`，队列位置 ${i.queue_position}`:''}${i.new_rate_mbps?`，新速率 ${i.new_rate_mbps} Mbps`:''}</div>`).join('')||'<div class="imp">无排程影响明细</div>';
+ const old=x.old_window?`${esc(x.old_window.starts_at)} ~ ${esc(x.old_window.ends_at)}（r${x.base_revision}）`:'—';
+ const next=x.new_window?`${esc(x.new_window.starts_at)} ~ ${esc(x.new_window.ends_at)}（r${x.final_revision??'?'}）`:'未写入（保持上一版）';
+ return `<div class="d ${x.status}"><b>处置单 #${x.id}</b> <span class="meta">窗口 #${x.window_id} · 状态 ${x.status} · ${esc(x.actor)} · ${esc(x.created_at)}</span>${x.error?`<div class="imp">错误：${esc(x.error)}</div>`:''}<div class="meta">旧窗口：${old} → 新窗口：${next}</div>${impacts}</div>`;
+}
+async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});let s=await x.json();
+ let d='';
+ if(s.queue&&s.queue.length){d+='<h2>排队请求（按优先级）</h2>'+s.queue.map(q=>`<div class="imp">请求 #${q.request_id}（优先级 ${q.priority}，${q.data_mb} MB）— ${esc(q.disposition_reason||'排队中')}</div>`).join('');}
+ if(s.dispositions&&s.dispositions.length){d+='<h2>窗口变更处置单</h2>'+s.dispositions.map(dispositionCard).join('');}
+ document.getElementById('d').innerHTML=d;o.textContent=JSON.stringify(s,null,2)}load()</script>

@@ -18,8 +18,8 @@ python3 app.py --db satellite_scheduling.db
 - `POST /api/requests`：创建数据接收请求。
 - `POST /api/requests/{id}/schedule`、`/reschedule`：排程或重排被抢占请求。
 - `POST /api/schedules/{id}/start`、`/complete`、`/cancel`、`/preempt`：接收状态和紧急抢占。
-- `POST /api/visibility-windows/{id}/change`：窗口变化并返回受影响排程；已接收数据保留。
-- `GET /api/state`、`GET /api/schedules/{id}`：权限化状态查询。
+- `POST /api/visibility-windows/{id}/change`：窗口变更处置。请求体带 `expected_revision` 做乐观并发：版本过期返回 409 `window_revision_conflict`，窗口、排程和请求保持上一版。提交前先按窗口版本与排程快照生成处置单（`commit:false` 可只预览），影响分四类：`retained` 保留、`compressed` 压缩到新窗口（必要时提速）、`preserve_received_data` 已接收数据原样保留、`preempted` 抢占；容量不足的未接收请求进入排队（请求状态 `queued`），按优先级（高者优先）仲裁。写入失败时事务回滚恢复提交前数值，并登记 `failed` 处置单。
+- `GET /api/state`、`GET /api/schedules/{id}`、`GET /api/dispositions/{id}`：权限化状态查询，`/api/state` 含 `dispositions`（处置单与影响明细）和 `queue`（排队队列）。
 
 ## 测试
 

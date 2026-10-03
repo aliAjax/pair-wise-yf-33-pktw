@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,14 @@ class ApiError(Exception):
         super().__init__(message); self.status, self.code, self.message, self.details = status, code, message, details
 
 
+class _WindowRevisionConflict(Exception):
+    def __init__(self, details: dict[str, Any], plan: dict[str, Any]): self.details, self.plan = details, plan
+
+
+class _WindowChangeFailed(Exception):
+    def __init__(self, plan: dict[str, Any], cause: Exception): self.plan, self.cause = plan, cause
+
+
 def utcnow() -> datetime: return datetime.now(timezone.utc)
 def iso(value: datetime | None = None) -> str: return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 def parse_time(value: str | None) -> datetime:
@@ -35,6 +44,7 @@ def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: dateti
 class Repository:
     def __init__(self, path: str | Path):
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
+        self._tx_lock = threading.RLock()
         self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS satellites(id TEXT PRIMARY KEY, name TEXT NOT NULL, data_rate_mbps REAL NOT NULL, priority INTEGER NOT NULL, storage_capacity_mb REAL NOT NULL, tenant TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active');
@@ -46,13 +56,16 @@ class Repository:
         CREATE TABLE IF NOT EXISTS quotas(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, station_id TEXT NOT NULL REFERENCES stations(id), daily_seconds INTEGER NOT NULL, UNIQUE(tenant,station_id));
         CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS window_dispositions(id INTEGER PRIMARY KEY AUTOINCREMENT, window_id INTEGER NOT NULL REFERENCES visibility_windows(id), base_revision INTEGER NOT NULL, final_revision INTEGER, status TEXT NOT NULL, actor TEXT NOT NULL, old_json TEXT NOT NULL, new_json TEXT NOT NULL, snapshot_json TEXT NOT NULL, impacts_json TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL);
         """)
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try: yield self.conn; self.conn.execute("COMMIT")
-        except Exception: self.conn.execute("ROLLBACK"); raise
+        # 进程内串行化写事务：同一连接上禁止嵌套 BEGIN，同时避免两线程并发窗口变更时后到者盲覆盖
+        with self._tx_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try: yield self.conn; self.conn.execute("COMMIT")
+            except Exception: self.conn.execute("ROLLBACK"); raise
 
     @staticmethod
     def audit(conn: sqlite3.Connection, request_id: int | None, schedule_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -163,7 +176,7 @@ class SatelliteSchedulingService:
             window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
             antenna = conn.execute("SELECT * FROM antennas WHERE id=?", (antenna_id,)).fetchone()
             if not request or not window or not antenna: raise ApiError(404, "schedule_ref_not_found", "请求、窗口或天线不存在")
-            if request["status"] not in {"pending", "preempted"}: raise ApiError(409, "request_closed", "请求当前不能排程")
+            if request["status"] not in {"pending", "preempted", "queued"}: raise ApiError(409, "request_closed", "请求当前不能排程")
             if request["satellite_id"] != window["satellite_id"] or window["station_id"] != antenna["station_id"]: raise ApiError(409, "window_mismatch", "卫星、窗口和天线不匹配")
             station = conn.execute("SELECT * FROM stations WHERE id=?", (window["station_id"],)).fetchone()
             satellite = conn.execute("SELECT * FROM satellites WHERE id=?", (request["satellite_id"],)).fetchone()
@@ -247,39 +260,241 @@ class SatelliteSchedulingService:
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, "emergency_preemption", {"order_id": order_id, "reason": reason, "displaced_priority": row["priority"]})
             return {"schedule": self.get_schedule(schedule_id), "reschedule_required": True, "order_id": order_id}
 
-    def change_window(self, window_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _loads(value: str | None, default: Any) -> Any:
+        if not value: return default
+        try: return json.loads(value)
+        except (TypeError, ValueError): return default
+
+    def _window_snapshot(self, conn: sqlite3.Connection, window_id: int) -> list[dict[str, Any]]:
+        rows = conn.execute("SELECT * FROM schedules WHERE window_id=? AND status IN ('scheduled','receiving','received') ORDER BY id", (window_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def _plan_window_change(self, conn: sqlite3.Connection, window: sqlite3.Row, start: datetime, end: datetime, rate: float) -> dict[str, Any]:
+        """依据窗口版本对应的排程快照，列出保留、压缩、抢占影响。已接收数据保留原样。"""
+        start_s, end_s = iso(start), iso(end)
+        snapshot = self._window_snapshot(conn, window["id"])
+        station_id, satellite_id = window["station_id"], window["satellite_id"]
+        rate_cap = min(float(rate), float(conn.execute("SELECT data_rate_mbps FROM satellites WHERE id=?", (satellite_id,)).fetchone()[0]))
+        impacts: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        anchors: list[dict[str, Any]] = []
+        for row in snapshot:
+            if row["status"] == "received":
+                anchors.append(row)
+                sched_start, sched_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
+                impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preserve_received_data",
+                                "reason": "已接收数据不可回滚", "invalid": sched_start < start or sched_end > end})
+                continue
+            candidates.append(dict(row))
+
+        def schedule_conflicts(c: dict[str, Any], n_start: datetime, n_end: datetime) -> bool:
+            ns, ne = iso(n_start), iso(n_end)
+            for anchor in anchors + placed:
+                if anchor["antenna_id"] == c["antenna_id"] and overlap(n_start, n_end, parse_time(anchor["starts_at"]), parse_time(anchor["ends_at"])):
+                    return True
+                if anchor["satellite_id"] == c["satellite_id"] and overlap(n_start, n_end, parse_time(anchor["starts_at"]), parse_time(anchor["ends_at"])):
+                    return True
+            maintenance = conn.execute("""SELECT 1 FROM maintenance WHERE station_id=? AND (antenna_id IS NULL OR antenna_id=?) AND starts_at<? AND ends_at>?""",
+                                       (station_id, c["antenna_id"], ne, ns)).fetchone()
+            return maintenance is not None
+
+        displaced: list[tuple[dict[str, Any], str]] = []
+        # 先判定每个排程在新窗口内的自身可行性：无交集、速率或容量不足直接出局
+        feasible: list[dict[str, Any]] = []
+        for c in candidates:
+            c_start, c_end = parse_time(c["starts_at"]), parse_time(c["ends_at"])
+            n_start, n_end = max(c_start, start), min(c_end, end)
+            req = conn.execute("SELECT priority,data_mb,deadline FROM requests WHERE id=?", (c["request_id"],)).fetchone()
+            c["_priority"], c["_data_mb"], c["_deadline"], c["_new_start"], c["_new_end"] = req["priority"], float(req["data_mb"]), req["deadline"], n_start, n_end
+            if n_end <= n_start:
+                displaced.append((c, "新窗口与原排程无交集")); continue
+            antenna_row = conn.execute("SELECT max_rate_mbps FROM antennas WHERE id=?", (c["antenna_id"],)).fetchone()
+            c["_max_rate"] = min(rate_cap, float(antenna_row[0]) if antenna_row else rate_cap)
+            seconds = (n_end - n_start).total_seconds()
+            need_rate = c["_data_mb"] * 8 / seconds
+            if n_end > parse_time(c["_deadline"]):
+                displaced.append((c, "压缩后结束时间超过请求截止时间")); continue
+            if need_rate - c["_max_rate"] > 1e-9:
+                displaced.append((c, "新窗口容量不足")); continue
+            c["_need_rate"] = need_rate
+            feasible.append(c)
+        # 容量/设备仍有争用时，按优先级（高者优先，其次截止时间、排程号）抢占
+        feasible.sort(key=lambda c: (-int(c["_priority"]), c["_deadline"], c["id"]))
+        placed: list[dict[str, Any]] = []
+        for c in feasible:
+            if schedule_conflicts(c, c["_new_start"], c["_new_end"]):
+                displaced.append((c, "容量不足，按优先级被高优先级请求抢占")); continue
+            old_rate = float(c["rate_mbps"])
+            c["_new_rate"] = round(min(c["_max_rate"], max(old_rate, c["_need_rate"])), 6)
+            placed.append(c)
+            if iso(c["_new_start"]) != c["starts_at"] or iso(c["_new_end"]) != c["ends_at"]:
+                impacts.append({"schedule_id": c["id"], "request_id": c["request_id"], "action": "compressed",
+                                "reason": "窗口收缩，排程压缩到新窗口内", "old_start": c["starts_at"], "old_end": c["ends_at"],
+                                "old_rate_mbps": old_rate, "new_start": iso(c["_new_start"]), "new_end": iso(c["_new_end"]),
+                                "new_rate_mbps": c["_new_rate"], "priority": c["_priority"]})
+            else:
+                impacts.append({"schedule_id": c["id"], "request_id": c["request_id"], "action": "retained",
+                                "reason": "新窗口仍覆盖排程", "new_rate_mbps": c["_new_rate"], "priority": c["_priority"]})
+        # 未接收请求进入排队（按优先级排序，供后续重排）
+        displaced.sort(key=lambda item: (-int(item[0]["_priority"]), item[0]["_deadline"], item[0]["id"]))
+        queue: list[dict[str, Any]] = []
+        for position, (c, why) in enumerate(displaced, start=1):
+            impacts.append({"schedule_id": c["id"], "request_id": c["request_id"], "action": "preempted", "reason": why,
+                            "old_start": c["starts_at"], "old_end": c["ends_at"], "priority": c["_priority"], "queued": True, "queue_position": position})
+            queue.append({"schedule_id": c["id"], "request_id": c["request_id"], "priority": c["_priority"],
+                          "data_mb": c["_data_mb"], "deadline": c["_deadline"], "reason": why, "queue_position": position})
+        impacts.sort(key=lambda x: x["schedule_id"])
+        new_window = {"id": window["id"], "satellite_id": satellite_id, "station_id": station_id,
+                      "starts_at": start_s, "ends_at": end_s, "max_rate_mbps": float(rate), "revision": int(window["revision"]) + 1}
+        counts = {"retained": 0, "compressed": 0, "preempted": 0, "preserved": 0}
+        for item in impacts:
+            counts["preserved" if item["action"] == "preserve_received_data" else item["action"]] += 1
+        return {"impacts": impacts, "queue": queue, "old_window": dict(window), "new_window": new_window,
+                "placed": [{"id": c["id"], "starts_at": iso(c["_new_start"]), "ends_at": iso(c["_new_end"]), "rate_mbps": c["_new_rate"]} for c in placed],
+                "displaced_ids": [c["id"] for c, _ in displaced], "counts": counts, "snapshot": snapshot}
+
+    def _record_disposition(self, window_id: int, base_revision: int | None, final_revision: int | None, status: str,
+                            actor: str, role: str, plan: dict[str, Any] | None, error: str | None = None,
+                            conn: sqlite3.Connection | None = None) -> int:
+        """登记处置单。传入 conn 时随当前事务提交，否则用独立事务（冲突/失败留痕）。"""
+        old_window = (plan or {}).get("old_window")
+        new_window = (plan or {}).get("new_window")
+        snapshot = (plan or {}).get("snapshot", [])
+        impacts = (plan or {}).get("impacts", [])
+        sql = """INSERT INTO window_dispositions(window_id,base_revision,final_revision,status,actor,old_json,new_json,snapshot_json,impacts_json,error,created_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)"""
+        def _dump(value: Any) -> str: return json.dumps(value, ensure_ascii=False, default=str)
+        args = (window_id, base_revision, final_revision, status, actor,
+                _dump(old_window), _dump(new_window), _dump(snapshot), _dump(impacts), error, iso())
+
+        def _insert(c: sqlite3.Connection) -> int:
+            disposition_id = c.execute(sql, args).lastrowid
+            Repository.audit(c, None, None, actor, role, f"window_disposition_{status}",
+                             {"window_id": window_id, "disposition_id": disposition_id})
+            return disposition_id
+
+        if conn is not None: return _insert(conn)
+        with self.repo.tx() as c: return _insert(c)
+
+    def change_window(self, window_id: int, actor: str, role: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """窗口变更处置入口：事务回滚后再登记冲突/失败处置单。"""
+        try:
+            return self._change_window_tx(window_id, actor, role, body)
+        except _WindowRevisionConflict as conflict:
+            # 事务此时已随 with tx() 回滚，可以用独立事务登记冲突处置单
+            plan = conflict.plan
+            disposition_id = self._record_disposition(window_id, conflict.details["current_revision"], None, "conflicted",
+                                                      actor, role, plan, error=f"expected_revision={conflict.details['expected_revision']}")
+            # 冲突后读回上一版窗口、排程和请求（未写入任何变更）
+            details = {**conflict.details, "disposition_id": disposition_id}
+            raise ApiError(409, "window_revision_conflict",
+                           f"窗口版本过期：基线 r{conflict.details['expected_revision']}，当前 r{conflict.details['current_revision']}，窗口、排程和请求保持上一版",
+                           details) from None
+        except _WindowChangeFailed as failed:
+            # 事务已 ROLLBACK，提交前数值已恢复；在独立事务登记失败处置单
+            plan = failed.plan
+            disposition_id = self._record_disposition(window_id, plan["old_window"]["revision"], None, "failed",
+                                                      actor, role, plan, error=repr(failed.cause))
+            raise ApiError(500, "window_change_write_failed",
+                           f"窗口变更写入失败，已恢复提交前数值: {failed.cause}",
+                           {"disposition_id": disposition_id, "window": plan["old_window"],
+                            "impacts": plan["impacts"], "queue": plan["queue"]}) from failed.cause
+
+    def _change_window_tx(self, window_id: int, actor: str, role: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if role not in {"operator", "commander"}: raise ApiError(403, "window_forbidden", "当前角色不能变更可见窗口")
         start, end = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
         if end <= start: raise ApiError(400, "invalid_window", "窗口结束时间必须晚于开始时间")
+        rate = body.get("max_rate_mbps")
+        if rate is not None and (not isinstance(rate, (int, float)) or float(rate) <= 0):
+            raise ApiError(400, "invalid_window", "窗口最大速率无效")
+        expected = body.get("expected_revision", body.get("revision"))
+        if expected is not None and not isinstance(expected, int): raise ApiError(400, "invalid_revision", "expected_revision 必须是整数")
+        commit = bool(body.get("commit", True))
         with self.repo.tx() as conn:
             window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
             if not window: raise ApiError(404, "window_not_found", "可见窗口不存在")
-            rows = conn.execute("SELECT * FROM schedules WHERE window_id=? AND status IN ('scheduled','receiving','received')", (window_id,)).fetchall()
-            impacts = []
-            for row in rows:
-                sched_start, sched_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
-                invalid = sched_start < start or sched_end > end
-                if row["status"] == "received":
-                    impacts.append({"schedule_id": row["id"], "action": "preserve_received_data", "reason": "已接收数据不可回滚", "invalid": invalid})
-                    continue
-                if invalid:
-                    conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
-                    conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
-                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted", "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]})
-                else:
-                    impacts.append({"schedule_id": row["id"], "action": "unchanged", "reason": "新窗口仍覆盖排程"})
-            conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,revision=revision+1 WHERE id=?", (iso(start), iso(end), window_id))
-            Repository.audit(conn, None, None, actor, role, "visibility_window_changed", {"window_id": window_id, "impacts": impacts})
-            return {"window": dict(conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()), "impacts": impacts}
+            base_revision = int(window["revision"])
+            if expected is not None and expected != base_revision:
+                # 窗口版本过期：不写任何数据，回滚后读回上一版窗口与排程快照
+                snapshot = self._window_snapshot(conn, window_id)
+                plan = {"old_window": dict(window), "new_window": None, "impacts": [], "queue": [],
+                        "snapshot": snapshot, "counts": {}}
+                details = {"window_id": window_id, "expected_revision": expected, "current_revision": base_revision,
+                           "window": dict(window), "schedules": snapshot, "plan": plan}
+                raise _WindowRevisionConflict(details, plan)
+            new_rate = float(rate) if rate is not None else float(window["max_rate_mbps"])
+            plan = self._plan_window_change(conn, window, start, end, new_rate)
+            if not commit:
+                disposition_id = self._record_disposition(window_id, base_revision, None, "previewed", actor, role, plan, conn=conn)
+                return 200, {"disposition_id": disposition_id, "committed": False, "window": dict(window),
+                             "new_window": plan["new_window"], "impacts": plan["impacts"], "queue": plan["queue"],
+                             "counts": plan["counts"]}
+            now = iso()
+            try:
+                for cid in plan["displaced_ids"]:
+                    conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?",
+                                 ("visibility_window_changed", now, cid))
+                    conn.execute("UPDATE requests SET status='queued' WHERE id=(SELECT request_id FROM schedules WHERE id=?)", (cid,))
+                for item in plan["placed"]:
+                    conn.execute("UPDATE schedules SET starts_at=?,ends_at=?,rate_mbps=?,revision=revision+1,updated_at=? WHERE id=?",
+                                 (item["starts_at"], item["ends_at"], float(item["rate_mbps"]), now, item["id"]))
+                conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,max_rate_mbps=?,revision=revision+1 WHERE id=?",
+                             (iso(start), iso(end), new_rate, window_id))
+                final_window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
+                final_revision = int(final_window["revision"])
+                plan["new_window"] = dict(final_window)
+                disposition_id = self._record_disposition(window_id, base_revision, final_revision, "applied", actor, role, plan, conn=conn)
+            except ApiError: raise
+            except Exception as exc:
+                # 写入失败：ROLLBACK 恢复提交前的窗口、排程和请求数值，外层登记失败处置单
+                raise _WindowChangeFailed(plan, exc) from exc
+            Repository.audit(conn, None, None, actor, role, "visibility_window_changed",
+                             {"window_id": window_id, "base_revision": base_revision, "final_revision": final_revision,
+                              "disposition_id": disposition_id, "impacts": plan["impacts"], "queue": plan["queue"]})
+            return 200, {"disposition_id": disposition_id, "committed": True, "window": dict(final_window),
+                         "new_window": dict(final_window), "impacts": plan["impacts"], "queue": plan["queue"],
+                         "counts": plan["counts"], "base_revision": base_revision, "final_revision": final_revision}
 
     def reschedule(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         with self.repo.tx() as conn:
             request = conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
             if not request: raise ApiError(404, "request_not_found", "请求不存在")
-            if request["status"] != "preempted": raise ApiError(409, "reschedule_not_needed", "只有被抢占请求需要重排")
+            if request["status"] not in {"preempted", "queued"}: raise ApiError(409, "reschedule_not_needed", "只有被抢占或排队中的请求需要重排")
             conn.execute("UPDATE requests SET status='pending' WHERE id=?", (request_id,))
             Repository.audit(conn, request_id, None, actor, role, "reschedule_requested", {"reason": body.get("reason", "")})
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
+
+    def list_dispositions(self, role: str, tenant: str, limit: int = 50) -> list[dict[str, Any]]:
+        conn = self.repo.conn
+        rows = conn.execute("SELECT * FROM window_dispositions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        items = []
+        for row in rows:
+            item = {"id": row["id"], "window_id": row["window_id"], "base_revision": row["base_revision"],
+                    "final_revision": row["final_revision"], "status": row["status"], "actor": row["actor"],
+                    "error": row["error"], "created_at": row["created_at"],
+                    "old_window": self._loads(row["old_json"], None), "new_window": self._loads(row["new_json"], None),
+                    "impacts": self._loads(row["impacts_json"], [])}
+            if role == "requester":
+                tenant_ids = {r["id"] for r in conn.execute("SELECT id FROM requests WHERE tenant=?", (tenant,))}
+                item["impacts"] = [i for i in item["impacts"] if i.get("request_id") in tenant_ids]
+                item["snapshot"] = [s for s in self._loads(row["snapshot_json"], []) if s.get("request_id") in tenant_ids]
+            items.append(item)
+        return items
+
+    def get_disposition(self, disposition_id: int, role: str, tenant: str) -> dict[str, Any]:
+        row = self.repo.conn.execute("SELECT * FROM window_dispositions WHERE id=?", (disposition_id,)).fetchone()
+        if not row: raise ApiError(404, "disposition_not_found", "处置单不存在")
+        impacts = self._loads(row["impacts_json"], [])
+        snapshot = self._loads(row["snapshot_json"], [])
+        if role == "requester":
+            tenant_ids = {r["id"] for r in self.repo.conn.execute("SELECT id FROM requests WHERE tenant=?", (tenant,))}
+            impacts = [i for i in impacts if i.get("request_id") in tenant_ids]
+            snapshot = [s for s in snapshot if s.get("request_id") in tenant_ids]
+        return {"id": row["id"], "window_id": row["window_id"], "base_revision": row["base_revision"],
+                "final_revision": row["final_revision"], "status": row["status"], "actor": row["actor"],
+                "error": row["error"], "created_at": row["created_at"], "old_window": self._loads(row["old_json"], None),
+                "new_window": self._loads(row["new_json"], None), "snapshot": snapshot, "impacts": impacts}
 
     def state(self, role: str, tenant: str) -> dict[str, Any]:
         conn = self.repo.conn
@@ -293,7 +508,18 @@ class SatelliteSchedulingService:
             requests = [dict(r) for r in conn.execute("SELECT * FROM requests ORDER BY id DESC")]
             schedules = [dict(r) for r in conn.execute("SELECT * FROM schedules ORDER BY id DESC")]
             stations = [dict(r) for r in conn.execute("SELECT * FROM stations ORDER BY id")]
-        return {"requests": requests, "schedules": schedules, "stations": stations, "server_time": iso()}
+        queue = conn.execute("""SELECT r.id request_id,r.tenant,r.priority,r.data_mb,r.deadline,s.id schedule_id,s.disposition_reason
+                                FROM requests r JOIN schedules s ON s.request_id=r.id WHERE r.status='queued'
+                                ORDER BY r.priority DESC,r.deadline,r.id""").fetchall()
+        queue_rows = [dict(r) for r in queue]
+        if role == "requester": queue_rows = [q for q in queue_rows if q["tenant"] == tenant]
+        if role == "viewer": queue_rows = []
+        dispositions = self.list_dispositions(role, tenant)
+        if role == "viewer":
+            for item in dispositions:
+                item.pop("old_window", None)
+        return {"requests": requests, "schedules": schedules, "stations": stations,
+                "queue": queue_rows, "dispositions": dispositions, "server_time": iso()}
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -316,6 +542,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, tenant)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
+        if len(parts) == 3 and parts[:2] == ["api", "dispositions"] and parts[2].isdigit():
+            return 200, self.service.get_disposition(int(parts[2]), role, tenant)
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, tenant = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
@@ -338,7 +566,7 @@ class Handler(BaseHTTPRequestHandler):
             if action in {"start", "complete"}: return 200, self.service.transition(sid, actor, role, tenant, "receiving" if action == "start" else "received", body)
             if action == "cancel": return 200, self.service.cancel_schedule(sid, actor, role, tenant, body)
             if action == "preempt": return 200, self.service.emergency_preempt(sid, actor, role, body)
-        if len(parts) == 4 and parts[:2] == ["api", "visibility-windows"] and parts[2].isdigit() and parts[3] == "change": return 200, self.service.change_window(int(parts[2]), actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "visibility-windows"] and parts[2].isdigit() and parts[3] == "change": return self.service.change_window(int(parts[2]), actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
